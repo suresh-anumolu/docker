@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/continuity/pathdriver"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/pkg/archive"
@@ -22,6 +21,31 @@ import (
 // a tar archive to a directory in a container has failed because the specified
 // path does not refer to a directory.
 var ErrExtractPointNotDirectory = errors.New("extraction point is not a directory")
+
+// The daemon will use the following interfaces if the container fs implements
+// these for optimized copies to and from the container.
+type extractor interface {
+	ExtractArchive(src io.Reader, dst string, opts *archive.TarOptions) error
+}
+
+type archiver interface {
+	ArchivePath(src string, opts *archive.TarOptions) (io.ReadCloser, error)
+}
+
+// helper functions to extract or archive
+func extractArchive(i interface{}, src io.Reader, dst string, opts *archive.TarOptions) error {
+	if ea, ok := i.(extractor); ok {
+		return ea.ExtractArchive(src, dst, opts)
+	}
+	return chrootarchive.Untar(src, dst, opts)
+}
+
+func archivePath(i interface{}, src string, opts *archive.TarOptions) (io.ReadCloser, error) {
+	if ap, ok := i.(archiver); ok {
+		return ap.ArchivePath(src, opts)
+	}
+	return archive.TarWithOptions(src, opts)
+}
 
 // ContainerCopy performs a deprecated operation of archiving the resource at
 // the specified path in the container identified by the given name.
@@ -171,7 +195,9 @@ func (daemon *Daemon) containerArchivePath(container *container.Container, path 
 	// also catches the case when the root directory of the container is
 	// requested: we want the archive entries to start with "/" and not the
 	// container ID.
-	data, err := archive.TarResourceRebase(resolvedPath, filepath.Base(absPath))
+	driver := container.BaseFS
+	sourceDir, opts := archive.TarResourceRebaseOpts(resolvedPath, driver.Base(absPath), driver)
+	data, err := archivePath(driver, sourceDir, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -210,8 +236,10 @@ func (daemon *Daemon) containerExtractToDir(container *container.Container, path
 		return err
 	}
 
+	driver := container.BaseFS
+
 	// Check if a drive letter supplied, it must be the system drive. No-op except on Windows
-	path, err = system.CheckSystemDriveAndRemoveDriveLetter(path, pathdriver.LocalPathDriver)
+	path, err = system.CheckSystemDriveAndRemoveDriveLetter(path, driver)
 	if err != nil {
 		return err
 	}
@@ -224,9 +252,9 @@ func (daemon *Daemon) containerExtractToDir(container *container.Container, path
 
 	// Consider the given path as an absolute path in the container.
 	absPath := archive.PreserveTrailingDotOrSeparator(
-		filepath.Join(string(filepath.Separator), path),
+		driver.Join(string(driver.Separator()), path),
 		path,
-		pathdriver.LocalPathDriver)
+		driver)
 
 	// This will evaluate the last path element if it is a symlink.
 	resolvedPath, err := container.GetResourcePath(absPath)
@@ -234,7 +262,7 @@ func (daemon *Daemon) containerExtractToDir(container *container.Container, path
 		return err
 	}
 
-	stat, err := os.Lstat(resolvedPath)
+	stat, err := driver.Lstat(resolvedPath)
 	if err != nil {
 		return err
 	}
@@ -257,21 +285,24 @@ func (daemon *Daemon) containerExtractToDir(container *container.Container, path
 	// a volume file path.
 	var baseRel string
 	if strings.HasPrefix(resolvedPath, `\\?\Volume{`) {
-		if strings.HasPrefix(resolvedPath, container.BaseFS) {
-			baseRel = resolvedPath[len(container.BaseFS):]
+		if strings.HasPrefix(resolvedPath, driver.Path()) {
+			baseRel = resolvedPath[len(driver.Path()):]
 			if baseRel[:1] == `\` {
 				baseRel = baseRel[1:]
 			}
 		}
 	} else {
-		baseRel, err = filepath.Rel(container.BaseFS, resolvedPath)
+		baseRel, err = filepath.Rel(driver.Path(), resolvedPath)
 	}
 	if err != nil {
 		return err
 	}
 	// Make it an absolute path.
-	absPath = filepath.Join(string(filepath.Separator), baseRel)
+	absPath = driver.Join(string(driver.Separator()), baseRel)
 
+	// @ TODO: gupta-ak: Technically, this works since it no-ops
+	// on Windows and the file system is local anyway on linux.
+	// But eventually, it should be made driver aware.
 	toVolume, err := checkIfPathIsInAVolume(container, absPath)
 	if err != nil {
 		return err
@@ -293,7 +324,7 @@ func (daemon *Daemon) containerExtractToDir(container *container.Container, path
 		}
 	}
 
-	if err := chrootarchive.Untar(content, resolvedPath, options); err != nil {
+	if err := extractArchive(driver, content, resolvedPath, options); err != nil {
 		return err
 	}
 
@@ -331,24 +362,26 @@ func (daemon *Daemon) containerCopy(container *container.Container, resource str
 		return nil, err
 	}
 
+	driver := container.BaseFS
+
 	basePath, err := container.GetResourcePath(resource)
 	if err != nil {
 		return nil, err
 	}
-	stat, err := os.Stat(basePath)
+	stat, err := driver.Stat(basePath)
 	if err != nil {
 		return nil, err
 	}
 	var filter []string
 	if !stat.IsDir() {
-		d, f := filepath.Split(basePath)
+		d, f := driver.Split(basePath)
 		basePath = d
 		filter = []string{f}
 	} else {
-		filter = []string{filepath.Base(basePath)}
-		basePath = filepath.Dir(basePath)
+		filter = []string{driver.Base(basePath)}
+		basePath = driver.Dir(basePath)
 	}
-	archive, err := archive.TarWithOptions(basePath, &archive.TarOptions{
+	archive, err := archivePath(driver, basePath, &archive.TarOptions{
 		Compression:  archive.Uncompressed,
 		IncludeFiles: filter,
 	})
@@ -399,16 +432,19 @@ func (daemon *Daemon) CopyOnBuild(cID, destPath, srcRoot, srcPath string, decomp
 		return err
 	}
 
+	driver := c.BaseFS
+	separator := string(driver.Separator())
+
 	// Preserve the trailing slash
 	// TODO: why are we appending another path separator if there was already one?
-	if strings.HasSuffix(destPath, string(os.PathSeparator)) || destPath == "." {
+	if strings.HasSuffix(destPath, separator) || destPath == "." {
 		destDir = true
-		dest += string(os.PathSeparator)
+		dest += separator
 	}
 
 	destPath = dest
 
-	destStat, err := os.Stat(destPath)
+	destStat, err := driver.Stat(destPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			//logrus.Errorf("Error performing os.Stat on %s. %s", destPath, err)
@@ -417,8 +453,9 @@ func (daemon *Daemon) CopyOnBuild(cID, destPath, srcRoot, srcPath string, decomp
 		destExists = false
 	}
 
+	// TODO: @gupta-ak. Fix this.
 	archiver := chrootarchive.NewArchiver(daemon.idMappings)
-	src, err := os.Stat(fullSrcPath)
+	src, err := driver.Stat(fullSrcPath)
 	if err != nil {
 		return err
 	}
