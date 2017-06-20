@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"io"
+
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
@@ -12,7 +14,6 @@ import (
 	"github.com/docker/docker/registry"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
-	"io"
 )
 
 type releaseableLayer struct {
@@ -32,7 +33,12 @@ func (rl *releaseableLayer) Mount() (string, error) {
 		return "", errors.Wrap(err, "failed to create rwlayer")
 	}
 
-	return rl.rwLayer.Mount("")
+	// TODO: @gupta-ak. Fix this for later commit.
+	path, err := rl.rwLayer.Mount("")
+	if err != nil {
+		return "", err
+	}
+	return path.Path(), nil
 }
 
 func (rl *releaseableLayer) Release() error {
